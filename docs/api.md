@@ -17,6 +17,8 @@
 - `POST /patients/{patient_id}/consents` 创建更高版本的授权；`POST /consents/{consent_id}/withdraw` 撤回授权。
 - `POST /patients/{patient_id}/plans` 建立计划，医美和体重管理计划必须引用当前对应授权。
 - `POST /plans/{plan_id}/{propose|activate|pause|resume|complete|cancel}` 以 `expected_version` 执行带版本保护的状态转换。
+- 计划生效（`activate` 或 `resume`）前，系统在同一事务内核对患者仍在有效期内的停止级安全关注项：存在未复核记录时拒绝生效，返回 409 及关注项编号与版本，并将拦截写入审计；医生复核确认并留下依据后重试即可继续，已失效或已解除的记录不影响生效。
+- `POST /patients/{patient_id}/clinical-flags` 记录患者安全关注项；`GET` 同路径列出；`POST /clinical-flags/{flag_id}/{confirm|resolve}` 由医生或负责人以 `expected_version` 复核，确认与解除均须留下依据。
 - `GET /patients/{patient_id}/weight-series` 返回按观察时间排序的测量值，不生成诊断或治疗建议。
 
 评估签署后不可覆盖。就诊病历由章节组成，签署需要主诉、评估和计划三部分；签署后的补充内容成为新版本，原始文字仍保留。
@@ -45,7 +47,7 @@
 
 ## 主要状态
 
-- 计划：草稿 → 提议 → 生效；可暂停和恢复，完成或取消后不能重新激活。
+- 计划：草稿 → 提议 → 生效；生效与恢复前须通过停止级安全关注项核对；可暂停和恢复，完成或取消后不能重新激活。
 - 预约：占位 → 确认 → 到诊 → 服务中 → 完成；取消和未到诊是独立终态。
 - 不良事件：已报告 → 分诊 → 观察 → 已解决 → 关闭。每次处置单独记录操作人和理由。
 - 耗材预留：预留 → 释放或核销。库存数量由收货、预留、释放和更正流水求和，不直接改写历史数量。

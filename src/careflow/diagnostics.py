@@ -42,6 +42,7 @@ class ConsistencyChecker:
         self.check_consent_dependencies()
         self.check_expiring_consents()
         self.check_unreviewed_safety_flags()
+        self.check_active_plan_stop_flags()
         self.check_owner_access()
         self.check_patient_merge_targets()
         self.check_appointment_state()
@@ -75,6 +76,19 @@ class ConsistencyChecker:
                      {"patient_id": row["patient_id"], "category": row["category"],
                       "severity": row["severity"], "effective_from": row["effective_from"]},
                      "由临床负责人尽快核实记录来源并留下复核结论。")
+
+    def check_active_plan_stop_flags(self) -> None:
+        rows = self.connection.execute(
+            "SELECT p.id AS plan_id,p.patient_id,p.kind,f.id AS flag_id,f.category,f.version "
+            "FROM plans p JOIN clinical_flags f ON f.patient_id=p.patient_id "
+            "WHERE p.clinic_id=? AND p.state='active' AND f.severity='stop' AND f.state='reported' "
+            "AND f.effective_from<=? AND (f.effective_until IS NULL OR f.effective_until>?) "
+            "ORDER BY p.id,f.id", (self.clinic_id, self.as_of, self.as_of)).fetchall()
+        for row in rows:
+            self.add("plan.active_with_unreviewed_stop_flag", "critical", "plan", row["plan_id"],
+                     {"patient_id": row["patient_id"], "kind": row["kind"], "flag_id": row["flag_id"],
+                      "flag_category": row["category"], "flag_version": row["version"]},
+                     "由临床岗位复核停止级关注项并评估是否暂停计划；复核依据须留在关注项记录中。")
 
     def check_expiring_consents(self) -> None:
         cutoff = (datetime.fromisoformat(self.as_of.replace("Z", "+00:00")) + timedelta(days=7)).isoformat(timespec="seconds").replace("+00:00", "Z")

@@ -84,9 +84,19 @@ class ClinicalFlagService:
                      "reviewed_by": row["reviewed_by"], "reviewed_at": row["reviewed_at"],
                      "version": row["version"]} for row in rows]
 
-    def blocking_flags(self, connection, patient_id: str, as_of: str) -> list[dict]:
-        rows = connection.execute("SELECT id,category,severity,state,effective_from,effective_until FROM clinical_flags "
+    def activation_gate(self, connection, patient_id: str, as_of: str) -> dict:
+        """计划生效前的停止级关注项核对。
+
+        未复核（reported）的停止级记录阻止生效；医生已确认并留下依据（confirmed）的
+        记录不再阻止，但其编号与版本作为放行依据返回，供调用方写入审计。已失效
+        （超出有效期）或已正式解除（resolved）的记录不参与核对，不会永久卡住计划。
+        调用方须在同一事务内完成核对与状态变更，保证依据的是同一时刻的数据版本。
+        """
+        rows = connection.execute("SELECT id,category,severity,state,version,effective_from,effective_until FROM clinical_flags "
                                   "WHERE patient_id=? AND severity='stop' AND state IN ('reported','confirmed') "
                                   "AND effective_from<=? AND (effective_until IS NULL OR effective_until>?) ORDER BY id",
                                   (patient_id, as_of, as_of)).fetchall()
-        return [dict(row) for row in rows]
+        blocking = [dict(row) for row in rows if row["state"] == "reported"]
+        released = [{"id": row["id"], "category": row["category"], "version": row["version"]}
+                    for row in rows if row["state"] == "confirmed"]
+        return {"blocking": blocking, "released": released, "as_of": as_of}

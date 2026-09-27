@@ -491,6 +491,7 @@ class Careflow:
         if action in {"pause", "cancel"}:
             reason = text(reason or "", "操作原因", maximum=600)
         now = self.now()
+        gate = None
         with self.db.transaction() as connection:
             principal = principal_for(connection, actor_id, clinic_id)
             authorize(principal, "clinical:write", clinic_id=clinic_id)
@@ -505,13 +506,35 @@ class Careflow:
                 consent = connection.execute("SELECT state,expires_at FROM consents WHERE id=?", (plan["consent_id"],)).fetchone()
                 if consent is None or consent["state"] != "granted" or (consent["expires_at"] and parsed_timestamp(consent["expires_at"]) <= parsed_timestamp(now)):
                     raise Conflict("计划授权已撤回或过期")
-            new_version = plan["version"] + 1
-            connection.execute("UPDATE plans SET state=?,updated_at=?,version=? WHERE id=?", (after, now, new_version, plan_id))
-            self._record_plan_revision(connection, plan_id, new_version, actor_id, reason or action, now)
-            audit.append_event(connection, clinic_id=clinic_id, actor_id=actor_id, patient_id=plan["patient_id"],
-                               aggregate_type="plan", aggregate_id=plan_id, action=f"plan.{action}", occurred_at=now,
-                               payload={"from": plan["state"], "to": after, "reason": reason, "version": new_version})
+            if action in {"activate", "resume"}:
+                # 核对与状态变更在同一事务内完成，依据同一时刻的患者与计划数据；
+                # 关注项在复核后被更新（新报告或状态变化）时，这里读到的是最新版本，不会用过期复核放行。
+                gate = self.clinical_flags.activation_gate(connection, plan["patient_id"], now)
+            if gate is None or not gate["blocking"]:
+                new_version = plan["version"] + 1
+                connection.execute("UPDATE plans SET state=?,updated_at=?,version=? WHERE id=?", (after, now, new_version, plan_id))
+                self._record_plan_revision(connection, plan_id, new_version, actor_id, reason or action, now)
+                payload = {"from": plan["state"], "to": after, "reason": reason, "version": new_version}
+                if gate is not None:
+                    payload["safety_check"] = {"as_of": gate["as_of"], "released_stop_flags": gate["released"]}
+                audit.append_event(connection, clinic_id=clinic_id, actor_id=actor_id, patient_id=plan["patient_id"],
+                                   aggregate_type="plan", aggregate_id=plan_id, action=f"plan.{action}", occurred_at=now,
+                                   payload=payload)
+        if gate is not None and gate["blocking"]:
+            self._record_activation_block(clinic_id, actor_id, plan, action, gate, now)
+            raise Conflict("存在未复核的停止级安全关注项，须由临床岗位复核后计划才能生效",
+                           details={"blocking_flags": [{"id": item["id"], "category": item["category"],
+                                                        "version": item["version"]} for item in gate["blocking"]]})
         return {"id": plan_id, "state": after, "version": new_version, "updated_at": now}
+
+    def _record_activation_block(self, clinic_id: str, actor_id: str, plan, action: str, gate: dict, now: str) -> None:
+        """拦截本身也留痕：独立事务写入，不随业务回滚消失，审计可还原谁依据哪版关注项被拦下。"""
+        with self.db.transaction() as connection:
+            audit.append_event(connection, clinic_id=clinic_id, actor_id=actor_id, patient_id=plan["patient_id"],
+                               aggregate_type="plan", aggregate_id=plan["id"], action="plan.activation_blocked",
+                               occurred_at=now,
+                               payload={"attempted_action": action, "plan_version": plan["version"],
+                                        "blocking_flags": gate["blocking"]})
 
     def plan_history(self, clinic_id: str, actor_id: str, plan_id: str) -> list[dict[str, Any]]:
         with self.db.transaction(write=False) as connection:

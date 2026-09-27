@@ -178,6 +178,96 @@ class CareflowCase(unittest.TestCase):
         flags = self.app.clinical_flags.list_for_patient(self.clinic, self.clinician, self.patient["id"])
         self.assertEqual(flags[0]["state"], "confirmed")
 
+    def test_unreviewed_stop_flag_blocks_activation_and_block_is_audited(self):
+        plan = self.plan()
+        self.app.transition_plan(self.clinic, self.clinician, plan["id"], 1, "propose")
+        flag = self.app.clinical_flags.report(self.clinic, self.nurse, self.patient["id"],
+                                              "prior_reaction", "stop", "填充剂既往不良反应待核实")
+        with self.assertRaises(Conflict) as blocked:
+            self.app.transition_plan(self.clinic, self.clinician, plan["id"], 2, "activate")
+        self.assertEqual(blocked.exception.details["blocking_flags"],
+                         [{"id": flag["id"], "category": "prior_reaction", "version": 1}])
+        self.assertEqual(self.app.plan_history(self.clinic, self.clinician, plan["id"])[-1]["snapshot"]["state"], "proposed")
+        events = [item for item in self.app.audit_history(self.clinic, self.owner)
+                  if item["action"] == "plan.activation_blocked"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["actor_id"], self.clinician)
+        self.assertEqual(events[0]["payload"]["attempted_action"], "activate")
+        self.assertEqual(events[0]["payload"]["plan_version"], 2)
+        self.assertEqual([item["id"] for item in events[0]["payload"]["blocking_flags"]], [flag["id"]])
+        self.assertTrue(self.app.verify_audit(self.clinic, self.owner)["ok"])
+
+    def test_confirmed_stop_flag_allows_activation_and_records_basis_version(self):
+        plan = self.plan()
+        self.app.transition_plan(self.clinic, self.clinician, plan["id"], 1, "propose")
+        flag = self.app.clinical_flags.report(self.clinic, self.nurse, self.patient["id"],
+                                              "prior_reaction", "stop", "既往反应待核实")
+        reviewed = self.app.clinical_flags.review(self.clinic, self.clinician, flag["id"], 1, "confirm",
+                                                  "已核对原始病历，反应与计划用药无关")
+        result = self.app.transition_plan(self.clinic, self.clinician, plan["id"], 2, "activate")
+        self.assertEqual(result["state"], "active")
+        events = [item for item in self.app.audit_history(self.clinic, self.owner) if item["action"] == "plan.activate"]
+        self.assertEqual(events[-1]["payload"]["safety_check"],
+                         {"as_of": "2026-09-27T12:00:00Z",
+                          "released_stop_flags": [{"id": flag["id"], "category": "prior_reaction",
+                                                   "version": reviewed["version"]}]})
+
+    def test_expired_or_resolved_stop_flag_does_not_block_activation(self):
+        plan = self.plan()
+        self.app.transition_plan(self.clinic, self.clinician, plan["id"], 1, "propose")
+        self.app.clinical_flags.report(self.clinic, self.nurse, self.patient["id"], "prior_reaction", "stop",
+                                       "已失效的历史记录", effective_from="2026-09-01T00:00:00Z",
+                                       effective_until="2026-09-20T00:00:00Z")
+        resolved = self.app.clinical_flags.report(self.clinic, self.nurse, self.patient["id"],
+                                                  "contraindication", "stop", "已正式解除的禁忌")
+        self.app.clinical_flags.review(self.clinic, self.clinician, resolved["id"], 1, "confirm", "已核实")
+        self.app.clinical_flags.review(self.clinic, self.clinician, resolved["id"], 2, "resolve", "复查已排除，正式解除")
+        self.app.clinical_flags.report(self.clinic, self.nurse, self.patient["id"], "other", "caution", "仅提示级别")
+        result = self.app.transition_plan(self.clinic, self.clinician, plan["id"], 2, "activate")
+        self.assertEqual(result["state"], "active")
+
+    def test_flag_reported_after_review_requires_fresh_judgment(self):
+        plan = self.plan()
+        self.app.transition_plan(self.clinic, self.clinician, plan["id"], 1, "propose")
+        first = self.app.clinical_flags.report(self.clinic, self.nurse, self.patient["id"],
+                                               "prior_reaction", "stop", "第一条待核实")
+        self.app.clinical_flags.review(self.clinic, self.clinician, first["id"], 1, "confirm", "已核实第一条")
+        second = self.app.clinical_flags.report(self.clinic, self.nurse, self.patient["id"],
+                                                "allergy", "stop", "复核过程中新报告的过敏史")
+        with self.assertRaises(Conflict):
+            self.app.transition_plan(self.clinic, self.clinician, plan["id"], 2, "activate")
+        with self.assertRaises(Conflict):
+            self.app.clinical_flags.review(self.clinic, self.clinician, second["id"], 99, "confirm", "版本不符")
+        self.app.clinical_flags.review(self.clinic, self.clinician, second["id"], 1, "confirm", "已核实新记录")
+        result = self.app.transition_plan(self.clinic, self.clinician, plan["id"], 2, "activate")
+        self.assertEqual(result["state"], "active")
+        blocked = [item for item in self.app.audit_history(self.clinic, self.owner)
+                   if item["action"] == "plan.activation_blocked"]
+        self.assertEqual([item["payload"]["blocking_flags"][0]["id"] for item in blocked], [second["id"]])
+
+    def test_resume_is_gated_by_stop_flags(self):
+        plan = self.plan()
+        self.app.transition_plan(self.clinic, self.clinician, plan["id"], 1, "propose")
+        self.app.transition_plan(self.clinic, self.clinician, plan["id"], 2, "activate")
+        self.app.transition_plan(self.clinic, self.clinician, plan["id"], 3, "pause", reason="患者要求暂停")
+        flag = self.app.clinical_flags.report(self.clinic, self.nurse, self.patient["id"],
+                                              "contraindication", "stop", "暂停期间新发现的禁忌")
+        with self.assertRaises(Conflict):
+            self.app.transition_plan(self.clinic, self.clinician, plan["id"], 4, "resume")
+        self.app.clinical_flags.review(self.clinic, self.clinician, flag["id"], 1, "confirm", "已评估并调整方案")
+        self.assertEqual(self.app.transition_plan(self.clinic, self.clinician, plan["id"], 4, "resume")["state"], "active")
+
+    def test_diagnostics_reports_active_plan_with_unreviewed_stop_flag(self):
+        plan = self.plan()
+        self.app.transition_plan(self.clinic, self.clinician, plan["id"], 1, "propose")
+        self.app.transition_plan(self.clinic, self.clinician, plan["id"], 2, "activate")
+        self.app.clinical_flags.report(self.clinic, self.nurse, self.patient["id"],
+                                       "prior_reaction", "stop", "生效后新报告的既往反应")
+        report = self.app.run_diagnostics(self.clinic, self.owner)
+        findings = {item["code"]: item for item in report["findings"]}
+        self.assertIn("plan.active_with_unreviewed_stop_flag", findings)
+        self.assertEqual(findings["plan.active_with_unreviewed_stop_flag"]["aggregate_id"], plan["id"])
+
     def test_encounter_requires_sections_and_amendment_preserves_signed_note(self):
         appointment = self.appointment()
         self.app.transition_appointment(self.clinic, self.coordinator, appointment["id"], 1, "book")
