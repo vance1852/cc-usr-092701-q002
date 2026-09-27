@@ -85,8 +85,13 @@ class ClinicalFlagService:
                      "version": row["version"]} for row in rows]
 
     def blocking_flags(self, connection, patient_id: str, as_of: str) -> list[dict]:
-        rows = connection.execute("SELECT id,category,severity,state,effective_from,effective_until FROM clinical_flags "
-                                  "WHERE patient_id=? AND severity='stop' AND state IN ('reported','confirmed') "
+        """仍在有效期内且未经医生复核的停止级关注项，用于计划生效前的事务内核对。
+
+        医生已确认（留有复核依据）、已正式解除或已过有效期的记录不阻止后续操作。
+        返回版本号，调用方据此在审计中说明决定所依据的资料版本。
+        """
+        rows = connection.execute("SELECT id,category,severity,state,effective_from,effective_until,version FROM clinical_flags "
+                                  "WHERE patient_id=? AND severity='stop' AND state='reported' "
                                   "AND effective_from<=? AND (effective_until IS NULL OR effective_until>?) ORDER BY id",
                                   (patient_id, as_of, as_of)).fetchall()
         return [dict(row) for row in rows]

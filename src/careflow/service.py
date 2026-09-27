@@ -491,6 +491,7 @@ class Careflow:
         if action in {"pause", "cancel"}:
             reason = text(reason or "", "操作原因", maximum=600)
         now = self.now()
+        blocked_flags: list[dict] = []
         with self.db.transaction() as connection:
             principal = principal_for(connection, actor_id, clinic_id)
             authorize(principal, "clinical:write", clinic_id=clinic_id)
@@ -505,12 +506,27 @@ class Careflow:
                 consent = connection.execute("SELECT state,expires_at FROM consents WHERE id=?", (plan["consent_id"],)).fetchone()
                 if consent is None or consent["state"] != "granted" or (consent["expires_at"] and parsed_timestamp(consent["expires_at"]) <= parsed_timestamp(now)):
                     raise Conflict("计划授权已撤回或过期")
-            new_version = plan["version"] + 1
-            connection.execute("UPDATE plans SET state=?,updated_at=?,version=? WHERE id=?", (after, now, new_version, plan_id))
-            self._record_plan_revision(connection, plan_id, new_version, actor_id, reason or action, now)
-            audit.append_event(connection, clinic_id=clinic_id, actor_id=actor_id, patient_id=plan["patient_id"],
-                               aggregate_type="plan", aggregate_id=plan_id, action=f"plan.{action}", occurred_at=now,
-                               payload={"from": plan["state"], "to": after, "reason": reason, "version": new_version})
+            if action in {"activate", "resume"}:
+                # 核对与状态变更处于同一事务，始终基于当前资料判断，不使用先前的复核结论代替本次检查。
+                blocked_flags = self.clinical_flags.blocking_flags(connection, plan["patient_id"], now)
+            if blocked_flags:
+                # 计划保持不变，但拦截决定本身留痕：由谁、依据哪版计划与哪版关注项作出。
+                audit.append_event(connection, clinic_id=clinic_id, actor_id=actor_id, patient_id=plan["patient_id"],
+                                   aggregate_type="plan", aggregate_id=plan_id, action="plan.activation_blocked",
+                                   occurred_at=now, payload={"action": action, "plan_state": plan["state"],
+                                                             "plan_version": plan["version"],
+                                                             "blocking_flags": [{"id": flag["id"], "category": flag["category"],
+                                                                                 "version": flag["version"]} for flag in blocked_flags]})
+            else:
+                new_version = plan["version"] + 1
+                connection.execute("UPDATE plans SET state=?,updated_at=?,version=? WHERE id=?", (after, now, new_version, plan_id))
+                self._record_plan_revision(connection, plan_id, new_version, actor_id, reason or action, now)
+                audit.append_event(connection, clinic_id=clinic_id, actor_id=actor_id, patient_id=plan["patient_id"],
+                                   aggregate_type="plan", aggregate_id=plan_id, action=f"plan.{action}", occurred_at=now,
+                                   payload={"from": plan["state"], "to": after, "reason": reason, "version": new_version})
+        if blocked_flags:
+            raise Conflict("存在仍在有效期内且未经医生复核的停止级安全关注项，计划不能生效",
+                           details={"blocking_flags": blocked_flags})
         return {"id": plan_id, "state": after, "version": new_version, "updated_at": now}
 
     def plan_history(self, clinic_id: str, actor_id: str, plan_id: str) -> list[dict[str, Any]]:

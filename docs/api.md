@@ -16,7 +16,7 @@
 - `POST /patients/{patient_id}/assessments` 新建评估草稿；`POST /assessments/{assessment_id}/sign` 由临床岗位签署。
 - `POST /patients/{patient_id}/consents` 创建更高版本的授权；`POST /consents/{consent_id}/withdraw` 撤回授权。
 - `POST /patients/{patient_id}/plans` 建立计划，医美和体重管理计划必须引用当前对应授权。
-- `POST /plans/{plan_id}/{propose|activate|pause|resume|complete|cancel}` 以 `expected_version` 执行带版本保护的状态转换。
+- `POST /plans/{plan_id}/{propose|activate|pause|resume|complete|cancel}` 以 `expected_version` 执行带版本保护的状态转换。`activate` 与 `resume` 在同一事务内核对患者安全关注项：存在仍在有效期内且未经医生复核的停止级记录时拒绝生效（409，响应列出待复核记录及版本），计划保持原状态，并记录 `plan.activation_blocked` 审计事件。
 - `GET /patients/{patient_id}/weight-series` 返回按观察时间排序的测量值，不生成诊断或治疗建议。
 
 评估签署后不可覆盖。就诊病历由章节组成，签署需要主诉、评估和计划三部分；签署后的补充内容成为新版本，原始文字仍保留。
@@ -41,11 +41,16 @@
 
 护理人员可报告事件或患者安全关注项；临床岗位复核并记录处置，诊所负责人可作废就诊记录。`GET /audit/verify` 校验诊所哈希链，`GET /audit/diagnostics` 汇报需人工核对的一致性问题，不自动修改业务状态。
 
+- `POST /patients/{patient_id}/clinical-flags` 记录患者安全关注项（类别、程度、事实依据与有效期）。
+- `POST /clinical-flags/{flag_id}/confirm` 由医生确认事实并留下复核依据；`POST /clinical-flags/{flag_id}/resolve` 在确认后正式解除。两者均以 `expected_version` 做版本校验，关注项被更新后须基于最新版本重新判断。
+- `GET /patients/{patient_id}/clinical-flags` 列出关注项；未复核的停止级记录会阻止计划生效，已确认、已解除或已过有效期的记录不再阻止。
+
 `POST /patients/{patient_id}/export` 只在存在有效数据导出授权时返回明确选择的章节。导出字段采用白名单，联系方式密文、凭据和内部合并字段不会导出；相同幂等请求得到相同内容摘要。`GET /reports/daily`、`appointments`、`incidents` 和 `overdue-milestones` 仅返回运营汇总或经岗位授权的工作队列。
 
 ## 主要状态
 
 - 计划：草稿 → 提议 → 生效；可暂停和恢复，完成或取消后不能重新激活。
+- 患者安全关注项：已报告 → 已确认 → 已解除。未复核的停止级记录阻止计划生效或恢复；每次拦截与解除均写入审计，可回溯操作人与所依据的资料版本。
 - 预约：占位 → 确认 → 到诊 → 服务中 → 完成；取消和未到诊是独立终态。
 - 不良事件：已报告 → 分诊 → 观察 → 已解决 → 关闭。每次处置单独记录操作人和理由。
 - 耗材预留：预留 → 释放或核销。库存数量由收货、预留、释放和更正流水求和，不直接改写历史数量。
